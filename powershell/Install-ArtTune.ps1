@@ -61,6 +61,23 @@ $script:ConfigIsPlaceholder = $false
 # the first call sees the user's real file. See Backup-EAPOConfigFile.
 $script:ForeignConfigBackup = $null
 
+# Backup root proven writable by Get-ArtTuneBackupRoot, cached for the run. Only
+# SUCCESSES are ever cached: a cached $null would turn one transient failure into a
+# dead end for every later backup, which is the defect this whole path exists to fix.
+# Initialized here because StrictMode faults on reading it before the first resolve.
+$script:BackupRoot = $null
+# True when THIS run created that root, so an abort can remove it again. Gate 1 of the
+# uninstall confirm advertises "nothing on the machine touched", and resolving a root
+# creates a directory -- without this flag that claim would be false.
+$script:BackupRootCreatedByUs = $false
+
+# Whether this run actually WROTE a user-data backup (library and/or E-APO config).
+# A script variable for the same reason as $script:PluginRemoval below: the uninstall
+# returns a single status string the caller switches on, and this is a second,
+# independent outcome. The completion text used to promise a backup on the strength of
+# "something was removed", which made it a lie in exactly the case that mattered.
+$script:UserDataBackedUp = $false
+
 # Outcome of the ArtTuneKit plugin removal inside Uninstall-ExistingEAPO. A script
 # variable rather than a return value: that function returns a single status string
 # the caller switches on, and the plugin result is a SECOND, independent outcome --
@@ -2065,6 +2082,146 @@ function Get-UrlToFile {
 # ============================================================================
 
 
+function Get-ArtTuneBackupRoot {
+    <#
+    .SYNOPSIS
+        Resolves an "Art Tune Backups" root that is PROVEN writable, or $null.
+    .DESCRIPTION
+        Every candidate is proven rather than assumed, because the checks that look
+        sufficient are not. Measured on PS 5.1:
+
+          New-Item -ItemType Directory -Force  reports success, returns zero objects,
+          throws nothing even under $ErrorActionPreference = 'Stop', and creates
+          NOTHING when the path runs through a dangling reparse point.
+
+        That single behaviour is why a backup could fail with "Could not find a part
+        of the path '...\Art Tune Backups\library-<stamp>'" on a machine whose
+        Documents folder was a stale OneDrive Known Folder Move junction.
+
+        The chain deliberately ends at LOCALAPPDATA. $script:ArtTuneDBRoot is NOT a
+        candidate: this helper is shared with Uninstall-ExistingEAPO, and uninstall
+        removes the ArtTuneDB tree -- a backup written there would be destroyed along
+        with the thing it was backing up.
+    .PARAMETER Force
+        Re-probe and ignore the cache. Passed by the retry affordances so a folder the
+        user has just fixed is re-detected instead of a stale failure being reused.
+    .OUTPUTS
+        Backup root path, or $null when no candidate survived.
+    #>
+    param([switch]$Force)
+
+    if (-not $Force -and $script:BackupRoot) { return $script:BackupRoot }
+
+    # Candidate 1 is GetFolderPath. SpecialFolderOption.None VERIFIES and returns
+    # String.Empty for a missing folder -- it is NOT DoNotVerify. Measured on
+    # PS 5.1.26100.8875 / CLR 4.0.30319. An empty return therefore means Documents is
+    # gone, and the candidate is skipped rather than joined onto: the old code joined
+    # it unconditionally, outside any try, where StrictMode turned it into an uncaught
+    # terminating error that killed the installer instead of degrading.
+    $candidates = @(
+        [Environment]::GetFolderPath('MyDocuments')
+        $(if ($env:OneDrive)    { Join-Path $env:OneDrive 'Documents' }    else { '' })
+        $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'Documents' } else { '' })
+        $env:USERPROFILE
+        $env:LOCALAPPDATA
+    )
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+        $root       = Join-Path $candidate 'Art Tune Backups'
+        $preExisted = Test-Path -LiteralPath $root
+        $accepted   = $false
+
+        try {
+            New-Item -Path $root -ItemType Directory -Force | Out-Null
+
+            # Do not trust the line above. Zero objects returned is a signal, not
+            # noise: through a dangling reparse point New-Item reports success and
+            # creates nothing. This assert is the only thing that catches that, and
+            # it also rejects a plain FILE sitting at this name (Directory::Exists is
+            # false for a file). .PSIsContainer was removed as fully subsumed by it.
+            if ([IO.Directory]::Exists($root)) {
+
+                # Probe write. THIS IS THE LOAD-BEARING GUARD. It is the only check
+                # that catches every failing state, and the sole detector for a
+                # dangling junction sitting at 'Art Tune Backups' ITSELF, where
+                # [IO.Directory]::Exists returns True and every cheaper check passes.
+                # It also catches Controlled Folder Access, which fails on write
+                # rather than on create. Do not optimize it out.
+                $probeFile = Join-Path $root '.arttune-write-probe'
+                try {
+                    Set-Content -LiteralPath $probeFile -Value 'probe' -Encoding Ascii -ErrorAction Stop
+                    Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
+                    $accepted = $true
+                }
+                catch {
+                    Write-Verbose "Backup root '$root': probe write failed ($($_.Exception.GetType().Name))."
+                    # Only ever remove what THIS run created. A pre-existing folder is
+                    # the user's, whatever state it turned out to be in.
+                    if (-not $preExisted) {
+                        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            else {
+                Write-Verbose "Backup root '$root': New-Item reported success but created nothing."
+            }
+        }
+        catch {
+            Write-Verbose "Backup root '$root': $($_.Exception.GetType().Name)."
+        }
+
+        if ($accepted) {
+            $script:BackupRoot            = $root
+            $script:BackupRootCreatedByUs = (-not $preExisted)
+            return $root
+        }
+    }
+
+    return $null
+}
+
+function Remove-UnusedBackupRoot {
+    <#
+    .SYNOPSIS
+        Removes the backup root when THIS run created it and nothing was written in.
+    .DESCRIPTION
+        Resolving a backup root is not a read-only act: Get-ArtTuneBackupRoot creates
+        the folder and writes a probe file to prove it is usable. So an uninstall that
+        resolves a root and is then cancelled would leave a directory behind, and the
+        cancel message ("nothing was changed") would be false.
+
+        Two things this deliberately will NOT do:
+          - touch a root that already existed. That folder is the user's, holding
+            previous backups, whatever this run decided about it.
+          - delete a NON-EMPTY root. A partial copy is still the user's data; it is
+            reported instead, so they can find it.
+    #>
+    if (-not $script:BackupRootCreatedByUs) { return }
+    if (-not $script:BackupRoot) { return }
+    if (-not (Test-Path -LiteralPath $script:BackupRoot)) {
+        # Already gone -- something else removed it. The cache still names it, and a
+        # cached path to a directory that no longer exists is the same defect class as
+        # caching a $null: a later caller would trust a hit that cannot be written to.
+        $script:BackupRoot            = $null
+        $script:BackupRootCreatedByUs = $false
+        return
+    }
+
+    $contents = @(Get-ChildItem -LiteralPath $script:BackupRoot -Force -ErrorAction SilentlyContinue)
+    if ($contents.Count -gt 0) {
+        Write-Host "$($script:BoxMargin)A partial backup was left at: $($script:BackupRoot)" -ForegroundColor DarkGray
+        return
+    }
+
+    Remove-Item -LiteralPath $script:BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+    # Clear the cache too: the proven-writable path no longer exists, and a later
+    # caller must re-resolve rather than trust a stale hit.
+    $script:BackupRoot            = $null
+    $script:BackupRootCreatedByUs = $false
+}
+
 function Backup-ArtTuneLibrary {
     <#
     .SYNOPSIS
@@ -2074,8 +2231,12 @@ function Backup-ArtTuneLibrary {
     .PARAMETER Rolling
         Use a single fixed backup dest (library-previous), overwriting any prior
         backup, instead of a timestamped folder. Used by the library updater.
+    .PARAMETER RefreshBackupRoot
+        Forwarded to Get-ArtTuneBackupRoot as -Force. Passed by the retry affordance
+        so a folder the user has just fixed is re-detected rather than a cached
+        result being reused.
     #>
-    param([switch]$Rolling)
+    param([switch]$Rolling, [switch]$RefreshBackupRoot)
 
     $libraryPath = Join-Path $env:ProgramFiles "EqualizerAPO\config\ArtTuneDB\library"
 
@@ -2084,36 +2245,78 @@ function Backup-ArtTuneLibrary {
     $childItems = @(Get-ChildItem -Path $libraryPath -Recurse -File -ErrorAction SilentlyContinue)
     if ($childItems.Count -eq 0) { return $null }
 
-    $docsFolder = [Environment]::GetFolderPath('MyDocuments')
-    $backupRoot = Join-Path $docsFolder "Art Tune Backups"
-    if ($Rolling) {
-        # Single rolling dest -- overwrite any prior backup (no timestamped pile).
-        $backupDest = Join-Path $backupRoot "library-previous"
-    } else {
-        $timestamp  = Get-Date -Format "yyyy-MM-dd_HHmmss"
-        $backupDest = Join-Path $backupRoot "library-$timestamp"
+    # Proven writable, not assumed. Get-ArtTuneBackupRoot also guarantees the root
+    # exists, which is why there is no New-Item on it below: the New-Item that used to
+    # live there is exactly the call whose reported success could not be trusted.
+    $backupRoot = Get-ArtTuneBackupRoot -Force:$RefreshBackupRoot
+    if (-not $backupRoot) {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)Warning: no writable backup location could be found." -ForegroundColor Yellow
+        return $false
     }
 
     Write-Host ""
     Write-Host "$($script:BoxMargin)Backing up ArtTuneDB library ($($childItems.Count) files)..." -ForegroundColor Cyan
 
     try {
-        if (-not (Test-Path $backupRoot)) {
-            New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+        # Inside the try on purpose. Join-Path resolves the PSDrive and throws
+        # "Cannot find drive" if it is gone -- and the root was proven writable a
+        # moment ago, not now. A removable drive pulled, or the folder deleted,
+        # between resolve and use would otherwise crash the installer uncaught,
+        # which is the same shape as the bug this whole change exists to fix.
+        if ($Rolling) {
+            # Single rolling dest -- overwrite any prior backup (no timestamped pile).
+            $backupDest = Join-Path $backupRoot "library-previous"
+        } else {
+            $timestamp  = Get-Date -Format "yyyy-MM-dd_HHmmss"
+            $backupDest = Join-Path $backupRoot "library-$timestamp"
         }
+
         if ($Rolling -and (Test-Path $backupDest)) {
             Remove-Item $backupDest -Recurse -Force -ErrorAction SilentlyContinue
         }
         Copy-Item -Path $libraryPath -Destination $backupDest -Recurse -Force
+
+        # Verify HERE, inside this function and before the return, never in a caller.
+        # Callers render a destructive-confirm prompt on the strength of the value
+        # returned below, so it has to be final by the time they see it.
+        #
+        # The baseline is re-enumerated WITHOUT -ErrorAction SilentlyContinue: the
+        # count taken at the top of this function suppresses errors, so an unreadable
+        # source file silently drops out of it and a short copy would compare equal.
+        # Unsuppressed, any such error throws into the catch and is reported as the
+        # failure it is. Bytes as well as count, because a copy that stalls mid-file
+        # yields the right file count and the wrong size.
+        # -lt, not -ne. The check exists to catch an INCOMPLETE copy, and the
+        # destination legitimately ends up with MORE than the source: Get-ChildItem
+        # -Recurse does not descend a junction inside library\, while Copy-Item
+        # -Recurse copies straight through it (measured: 1 file enumerated, 4 copied).
+        # Treating that as failure would send a user whose backup actually succeeded
+        # to a menu whose [b] option destroys the library.
+        $srcFiles  = @(Get-ChildItem -LiteralPath $libraryPath -Recurse -File)
+        $destFiles = @(Get-ChildItem -LiteralPath $backupDest  -Recurse -File)
+        $srcBytes  = ($srcFiles  | Measure-Object -Property Length -Sum).Sum
+        $destBytes = ($destFiles | Measure-Object -Property Length -Sum).Sum
+        if ($destFiles.Count -lt $srcFiles.Count -or $destBytes -lt $srcBytes) {
+            Write-Host "$($script:BoxMargin)Warning: backup verify failed -- copied $($destFiles.Count) of $($srcFiles.Count) files, $destBytes of $srcBytes bytes." -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)Incomplete backup left at: $backupDest" -ForegroundColor DarkGray
+            return $false
+        }
+
         Write-Host "$($script:BoxMargin)Library backed up to:" -ForegroundColor Green
         Write-Host "$($script:BoxMargin)$backupDest" -ForegroundColor DarkGray
         return $backupDest
     }
     catch {
-        Write-Host "$($script:BoxMargin)Warning: Library backup failed: $_" -ForegroundColor Yellow
-        Write-Host "$($script:BoxMargin)Continuing with uninstall..." -ForegroundColor Yellow
+        # Exception TYPE as well as message: the three filesystem states that produce
+        # this are indistinguishable from the message alone, and support cannot tell
+        # them apart without it.
+        Write-Host "$($script:BoxMargin)Warning: Library backup failed: $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)Backup location was: $backupRoot" -ForegroundColor DarkGray
         # $false, not $null: callers must be able to tell a FAILED backup from the two
         # "nothing to back up" cases above, which legitimately return $null.
+        # No caller-specific follow-up line here -- this function is shared by the
+        # install and uninstall paths, and each prints its own.
         return $false
     }
 }
@@ -2157,7 +2360,8 @@ function Backup-EAPOConfigFile {
     # the overwrite, so it captures the newest version of our file.
     if (-not $isOurs -and $script:ForeignConfigBackup) { return $script:ForeignConfigBackup }
 
-    $backupRoot = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "Art Tune Backups"
+    $backupRoot = Get-ArtTuneBackupRoot
+    if (-not $backupRoot) { return $null }
     if ($isOurs) {
         $backupDest = Join-Path $backupRoot "config-previous.txt"
     } else {
@@ -2166,9 +2370,6 @@ function Backup-EAPOConfigFile {
     }
 
     try {
-        if (-not (Test-Path $backupRoot)) {
-            New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
-        }
         Copy-Item -LiteralPath $configFile -Destination $backupDest -Force
 
         if ($isOurs) {
@@ -2204,18 +2405,19 @@ function Backup-EAPOConfig {
     $childItems = @(Get-ChildItem -Path $configPath -Recurse -File -ErrorAction SilentlyContinue)
     if ($childItems.Count -eq 0) { return $null }
 
-    $docsFolder = [Environment]::GetFolderPath('MyDocuments')
+    $backupRoot = Get-ArtTuneBackupRoot
+    if (-not $backupRoot) {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)Warning: no writable backup location could be found." -ForegroundColor Yellow
+        return $null
+    }
     $timestamp  = Get-Date -Format "yyyy-MM-dd_HHmmss"
-    $backupRoot = Join-Path $docsFolder "Art Tune Backups"
     $backupDest = Join-Path $backupRoot "eapo-config-$timestamp"
 
     Write-Host ""
     Write-Host "$($script:BoxMargin)Backing up E-APO config ($($childItems.Count) files)..." -ForegroundColor Cyan
 
     try {
-        if (-not (Test-Path $backupRoot)) {
-            New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
-        }
         Copy-Item -Path $configPath -Destination $backupDest -Recurse -Force
         Write-Host "$($script:BoxMargin)Config backed up to:" -ForegroundColor Green
         Write-Host "$($script:BoxMargin)$backupDest" -ForegroundColor DarkGray
@@ -2305,11 +2507,25 @@ function Uninstall-ExistingEAPO {
     <#
     .SYNOPSIS
         Removes an existing Equalizer APO installation with backup.
+    .DESCRIPTION
+        Two confirm gates guard the user's ArtTuneDB library, which lives inside the
+        tree this function destroys. See the comments at each gate for why they sit
+        where they do -- the placement is the whole point, not a detail.
     .OUTPUTS
-        'Removed' | 'NotFound' | 'Failed'
+        'Removed' | 'NotFound' | 'Failed' | 'Skipped'
+        'Skipped' means the user declined at a backup gate and the uninstall was
+        abandoned. Invoke-FreshStart already routes it to the "kept" list.
     #>
     $eapoPath = Join-Path $env:ProgramFiles "EqualizerAPO"
     $eapoUninstall = Join-Path $eapoPath "Uninstall.exe"
+
+    # Reset per invocation, not just at declaration. Both menu [2] Fresh Start and
+    # menu [4] Uninstall reach this function inside the same mainMenu loop, so a run
+    # whose backup succeeded can be followed by one whose backup fails. Without this
+    # the completion text would inherit the earlier $true and promise a backup that
+    # this run never wrote. Cleared before the NotFound return too, so an early exit
+    # cannot leave the flag set either.
+    $script:UserDataBackedUp = $false
 
     if (-not (Test-Path $eapoPath)) {
         Write-Host "$($script:BoxMargin)No existing E-APO detected, proceeding." -ForegroundColor DarkGray
@@ -2317,6 +2533,46 @@ function Uninstall-ExistingEAPO {
     }
 
     Write-Host "$($script:BoxMargin)Uninstalling E-APO..." -ForegroundColor Red
+
+    # Detection only, and deliberately hoisted above every mutation below so GATE 1
+    # can run before the machine has been touched at all.
+    $libraryPath = Join-Path $eapoPath "config\ArtTuneDB\library"
+    $libraryFiles = @(Get-ChildItem -Path $libraryPath -Recurse -File -ErrorAction SilentlyContinue)
+
+    # -- GATE 1: no backup location at all ----------------------------------
+    # Placed HERE, above the process kills, and that placement is load-bearing.
+    # Everything from the top of this function to this line is detection: path
+    # joins, a Test-Path, a Get-ChildItem. Nothing has been killed, stopped,
+    # deleted or written, so declining below leaves the machine exactly as found.
+    #
+    # One line further down is irreversible. The Stop-Process pair closes the
+    # user's audio tools, and the E-APO uninstaller further still deletes
+    # config\ArtTuneDB\library outright -- it is the FIRST thing that destroys the
+    # library, not the Remove-Item near the end of this function.
+    #
+    # Every failure state measured for the backup bug fails at root resolution, so
+    # this gate catches all of them before any cost is paid.
+    $acceptedNoBackup = $false
+    if ($libraryFiles.Count -gt 0 -and -not (Get-ArtTuneBackupRoot)) {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)No writable backup location could be found." -ForegroundColor Red
+        Write-Host "$($script:BoxMargin)Your ArtTuneDB library ($($libraryFiles.Count) files), including any squig.link" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)EQs you added, would be deleted with NO backup and no way to recover it." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)Type 'yes' to uninstall anyway, or anything else to cancel: " -ForegroundColor Yellow -NoNewline
+        $proceedNoBackup = Read-Host
+        if ($proceedNoBackup -ne 'yes') {
+            Remove-UnusedBackupRoot
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)Uninstall cancelled. Nothing on this PC was changed -- no files were" -ForegroundColor Green
+            Write-Host "$($script:BoxMargin)removed, no programs were closed, and no settings were altered." -ForegroundColor Green
+            return 'Skipped'
+        }
+        # Consent recorded so GATE 2 does not ask the same question twice. With no
+        # root resolvable the backup below is certain to fail, and re-prompting on
+        # that failure reads as the script not having heard the answer just given.
+        $acceptedNoBackup = $true
+    }
 
     # Kill LEQ Control Panel before device removal -- its COM audio callbacks
     # can crash if a third-party driver (e.g. Elgato) corrupts shared state
@@ -2326,12 +2582,47 @@ function Uninstall-ExistingEAPO {
 
     # Back up user data before destroying E-APO folder: the ArtTuneDB library
     # (dated, so squig.link EQs stay recoverable) AND the full E-APO config.
-    $libraryPath = Join-Path $eapoPath "config\ArtTuneDB\library"
-    $libraryFiles = @(Get-ChildItem -Path $libraryPath -Recurse -File -ErrorAction SilentlyContinue)
+    # $libraryPath / $libraryFiles came from the detection block above.
+    $libraryBackupFailed = $false
     if ($libraryFiles.Count -gt 0) {
-        $null = Backup-ArtTuneLibrary
+        $libraryBackup = Backup-ArtTuneLibrary
+        # -is [bool] rather than -eq $false: a returned path string compared against
+        # $false would coerce and could never match, so the guard has to test the
+        # type. $null (nothing to back up) is not a failure.
+        if ($libraryBackup -is [bool] -and -not $libraryBackup) { $libraryBackupFailed = $true }
+        elseif ($libraryBackup) { $script:UserDataBackedUp = $true }
     }
-    $null = Backup-EAPOConfig
+    $configBackup = Backup-EAPOConfig
+    if ($configBackup) { $script:UserDataBackedUp = $true }
+
+    # -- GATE 2: the backup ran and failed ----------------------------------
+    # Reached only when resolution succeeded but the copy itself did not, so gate 1
+    # could not have caught it. Still above the Stop-Service pair and well above the
+    # E-APO uninstaller, so declining stops the library from being destroyed.
+    #
+    # This abort is BOUNDED, NOT CLEAN, and the message must not pretend otherwise:
+    # the Stop-Process calls above have already closed the user's audio tools and
+    # nothing here undoes them. That is why the follow-up names them.
+    #
+    # Backup-ArtTuneLibrary verifies its own copy before returning, so the value
+    # tested here is already final -- there is no in-flight work behind this prompt.
+    if ($libraryBackupFailed -and -not $acceptedNoBackup) {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)The library backup FAILED, so there is nothing to restore from." -ForegroundColor Red
+        Write-Host "$($script:BoxMargin)Continuing deletes your ArtTuneDB library ($($libraryFiles.Count) files) and any" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)squig.link EQs in it, permanently." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)Type 'yes' to uninstall anyway, or anything else to cancel: " -ForegroundColor Yellow -NoNewline
+        $proceedFailedBackup = Read-Host
+        if ($proceedFailedBackup -ne 'yes') {
+            Remove-UnusedBackupRoot
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)Uninstall cancelled. Your library was NOT deleted." -ForegroundColor Green
+            Write-Host "$($script:BoxMargin)Note: LEQ Control Panel, Peace, HeSuVi and the E-APO editor were closed" -ForegroundColor DarkGray
+            Write-Host "$($script:BoxMargin)before the backup ran. Nothing else changed -- reopen them as normal." -ForegroundColor DarkGray
+            return 'Skipped'
+        }
+    }
 
     # Stop audio services first (E-APO hooks into them)
     Stop-Service -Name 'Audiosrv' -Force -ErrorAction SilentlyContinue
@@ -3370,8 +3661,16 @@ function Invoke-FreshStart {
             Write-Host ""
             Write-Host "$($script:BoxMargin)Removed: $($removed -join ', ')" -ForegroundColor Green
             Write-Host ""
-            Write-Host "$($script:BoxMargin)Your old config and library were backed up to Documents\Art Tune Backups\." -ForegroundColor DarkGray
-            Write-Host "$($script:BoxMargin)Old squig.link combos are recoverable there via the ArtTuneDB desktop shortcut." -ForegroundColor DarkGray
+            # Gated on a backup having actually been WRITTEN, not on "something was
+            # removed". Those are different facts, and printing this on the second one
+            # told users a backup existed precisely when it did not -- which is how the
+            # loss gets discovered a week later. The real resolved root is named too:
+            # it is only Documents when the first candidate won.
+            if ($script:UserDataBackedUp -and $script:BackupRoot) {
+                Write-Host "$($script:BoxMargin)Your old config and library were backed up to:" -ForegroundColor DarkGray
+                Write-Host "$($script:BoxMargin)$($script:BackupRoot)" -ForegroundColor DarkGray
+                Write-Host "$($script:BoxMargin)Old squig.link combos are recoverable there via the ArtTuneDB desktop shortcut." -ForegroundColor DarkGray
+            }
             Write-Host ""
             Write-Host "$($script:BoxMargin)A restart is required to finish removing drivers." -ForegroundColor Yellow
             Write-Host "$($script:BoxMargin)After restarting, re-run this script and choose [1] Install:" -ForegroundColor Yellow
@@ -4198,6 +4497,85 @@ function Get-ArtTuneLibraryState {
     return [pscustomobject]@{ State = 'None'; Version = '' }
 }
 
+function Test-LibraryBackupPreflight {
+    <#
+    .SYNOPSIS
+        Fails fast, BEFORE the download, on the backup problems a retry cannot fix.
+    .DESCRIPTION
+        Both checks catch failures that would otherwise surface only after a 1 MB
+        fetch, as a mid-copy error, with the real cause buried.
+
+        MAX_PATH is computed PER FILE as <root>\Art Tune Backups\library-<stamp>\ plus
+        that file's path RELATIVE to the library root, taking the max over the set.
+        Longest-source-path plus root length is the wrong maximum: the longest source
+        path can have a short relative segment. PS 5.1's FileSystem provider does not
+        get long-path support from the LongPathsEnabled policy alone, so 260 is real.
+
+        The enumeration deliberately omits -ErrorAction SilentlyContinue. A source path
+        already over the limit is exactly what this check exists to find, and a
+        suppressed enumeration would silently skip it.
+    .OUTPUTS
+        [bool] -- $false when the caller should not proceed to the download.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LibraryPath,
+        [Parameter(Mandatory)][string]$BackupRoot
+    )
+
+    try {
+        $files = @(Get-ChildItem -LiteralPath $LibraryPath -Recurse -File)
+    } catch {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)Your existing library cannot be read, so it cannot be backed up." -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)$($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor DarkGray
+        return $false
+    }
+    if ($files.Count -eq 0) { return $true }
+
+    # -- free space on the drive that will hold the backup --------------------
+    $needed = ($files | Measure-Object -Property Length -Sum).Sum
+    try {
+        $driveRoot = [IO.Path]::GetPathRoot($BackupRoot)
+        $drive     = New-Object IO.DriveInfo($driveRoot)
+        # IsReady is checked FIRST and the whole check skipped when false. On a
+        # not-ready drive (disconnected network share, empty removable bay) the
+        # constructor still succeeds and AvailableFreeSpace yields nothing rather than
+        # throwing, so the catch below never fires -- and a null there compares as 0,
+        # which would report a perfectly good machine as having a full disk.
+        $freeBytes = if ($drive.IsReady) { $drive.AvailableFreeSpace } else { $null }
+        if ($null -ne $freeBytes -and $freeBytes -lt $needed) {
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)Not enough free space to back up your library first." -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)Needs $([math]::Round($needed / 1MB, 1)) MB on $driveRoot, $([math]::Round($freeBytes / 1MB, 1)) MB is free." -ForegroundColor DarkGray
+            return $false
+        }
+    } catch {
+        # Not fatal: an unreadable drive is not a reason to block a backup that may
+        # well succeed. Recorded rather than swallowed.
+        Write-Verbose "Free-space check skipped: $($_.Exception.GetType().Name)."
+    }
+
+    # -- MAX_PATH, per file ---------------------------------------------------
+    # "library-yyyy-MM-dd_HHmmss" is 25 characters; +2 for the two separators.
+    $prefixLength = $BackupRoot.TrimEnd('\').Length + 2 + 25
+    $sourceBase   = $LibraryPath.TrimEnd('\').Length + 1
+    $longest      = 0
+    $longestName  = ''
+    foreach ($file in $files) {
+        $projected = $prefixLength + ($file.FullName.Length - $sourceBase)
+        if ($projected -gt $longest) { $longest = $projected; $longestName = $file.Name }
+    }
+    if ($longest -ge 260) {
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)A backup copy would exceed Windows' 260-character path limit." -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)Longest would be $longest characters, ending in '$longestName'." -ForegroundColor DarkGray
+        Write-Host "$($script:BoxMargin)Shorten that file's name, or move the backup folder nearer the drive root." -ForegroundColor DarkGray
+        return $false
+    }
+
+    return $true
+}
+
 function Install-ArtTuneLibrary {
     <#
     .SYNOPSIS
@@ -4214,6 +4592,23 @@ function Install-ArtTuneLibrary {
     param([switch]$SkipBackup)
 
     $libRoot = Join-Path $script:ArtTuneDBRoot "library"
+
+    # Set by the [r] affordance below so the next backup attempt re-probes the root
+    # instead of reusing a cached failure. Declared here because StrictMode faults on
+    # reading it before the first assignment.
+    $refreshRoot = $false
+
+    # Pre-flight BEFORE the fetch. Neither of these can be fixed by downloading, and
+    # discovering them afterwards costs the user a transfer and hides the cause behind
+    # a mid-copy error. Skipped when no root resolves at all -- that case is already
+    # handled properly by the backup itself and its menu.
+    if (-not $SkipBackup -and (Test-Path $libRoot)) {
+        $preflightRoot = Get-ArtTuneBackupRoot
+        if ($preflightRoot -and -not (Test-LibraryBackupPreflight -LibraryPath $libRoot -BackupRoot $preflightRoot)) {
+            Write-Host "$($script:BoxMargin)Nothing was downloaded and your library was not touched." -ForegroundColor Yellow
+            return $false
+        }
+    }
 
     :libRetry while ($true) {
         Write-Host "$($script:BoxMargin)Fetching ArtTuneDB library release..." -ForegroundColor Cyan
@@ -4285,23 +4680,119 @@ function Install-ArtTuneLibrary {
                 $srcRoot = (Get-Item -LiteralPath $srcRoot).FullName
 
                 # --- Back up any existing library (dated), then wipe and replace ---
-                # -is [bool] rather than -eq $false: a returned path string compared
-                # against $false would coerce and could never match, so the guard has to
-                # test the type. $null (nothing to back up) is not a failure.
-                $backupDest = $null
-                $backupFailed = $false
-                if (-not $SkipBackup -and (Test-Path $libRoot)) {
-                    $backupDest = Backup-ArtTuneLibrary
-                    if ($backupDest -is [bool] -and -not $backupDest) { $backupFailed = $true }
-                }
+                # This inner loop is the fix for the reported dead end. The download
+                # and extract above have already succeeded, so retrying THEM cannot
+                # clear a filesystem problem -- yet re-downloading was the only thing
+                # the old menu offered, which made a failed backup an inescapable loop.
+                # Everything below retries the BACKUP, and the staging tree is kept so
+                # no option here costs another transfer.
+                :backupRetry while ($true) {
 
-                if (-not $backupFailed) {
-                    New-Item -ItemType Directory -Path $libRoot -Force | Out-Null
-                    # Nuke the existing library so only the fresh release remains.
-                    Get-ChildItem -Path $libRoot -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                    $backupDest   = $null
+                    $backupFailed = $false
+                    $proceed      = $false
 
-                    # Lay down the fresh release.
-                    Copy-Item -Path (Join-Path $srcRoot '*') -Destination $libRoot -Recurse -Force
+                    if ($SkipBackup -or -not (Test-Path $libRoot)) {
+                        $proceed = $true
+                    } else {
+                        # -is [bool] rather than -eq $false: a returned path string
+                        # compared against $false would coerce and could never match,
+                        # so the guard has to test the type. $null (nothing to back up)
+                        # is not a failure.
+                        $backupDest  = Backup-ArtTuneLibrary -RefreshBackupRoot:$refreshRoot
+                        $refreshRoot = $false
+                        if ($backupDest -is [bool] -and -not $backupDest) { $backupFailed = $true }
+                        else { $proceed = $true }
+                    }
+
+                    if ($backupFailed) {
+                        # The existing library is left exactly as it is: the user's
+                        # squig.link EQs live inside the tree the nuke would clear, and
+                        # there would be nothing to restore them from.
+                        $menuOpen = $true
+                        while ($menuOpen) {
+                            Write-Host ""
+                            Write-Host "$($script:BoxMargin)Could not back up your existing library, so it was left untouched." -ForegroundColor Red
+                            Write-Host "$($script:BoxMargin)The download already worked -- retrying that cannot fix this." -ForegroundColor DarkGray
+                            Write-Host ""
+                            $null = Write-CenteredBlock @(
+                                @{ Text = '[r] Try the backup again'; Color = 'Yellow' }
+                                @{ Text = '[o] Show me the library folder so I can copy it myself'; Color = 'White' }
+                                @{ Text = '[b] Install anyway - REPLACES your library'; Color = 'Red' }
+                                @{ Text = '[d] Open Discord for help'; Color = 'White' }
+                                @{ Text = '[s] Skip - continue without the library'; Color = 'DarkGray' }
+                            )
+                            Write-Host ""
+                            Write-Host "$($script:BoxMargin)" -NoNewline
+                            Write-Host "Choice: " -ForegroundColor Yellow -NoNewline
+                            $bkChoice = "$(Read-Host)".ToLower()
+
+                            if ($bkChoice -eq 's') {
+                                Write-Host "$($script:BoxMargin)Skipping library. Tunes and bundled VST/JSFX will be missing." -ForegroundColor Yellow
+                                Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+                                return $false
+                            }
+                            elseif ($bkChoice -eq 'r') {
+                                # Re-probe instead of trusting the cache. The whole
+                                # point of this option is that the user has just fixed
+                                # the folder, and a cached failure would ignore that.
+                                $refreshRoot = $true
+                                $menuOpen    = $false
+                            }
+                            elseif ($bkChoice -eq 'o') {
+                                # Path printed as plain text FIRST. Explorer launched
+                                # from an elevated process does not reliably surface in
+                                # the user's session, and with nothing on screen the
+                                # option looks like it did nothing at all.
+                                Write-Host ""
+                                Write-Host "$($script:BoxMargin)Your library is here:" -ForegroundColor Cyan
+                                Write-Host "$($script:BoxMargin)$libRoot" -ForegroundColor White
+                                Write-Host "$($script:BoxMargin)Copy it somewhere safe, then choose [b] to install the new one." -ForegroundColor DarkGray
+                                Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$libRoot`""
+                            }
+                            elseif ($bkChoice -eq 'd') {
+                                Start-Process 'https://discord.gg/artiswar'
+                                Write-Host "$($script:BoxMargin)Opened in browser." -ForegroundColor Green
+                            }
+                            elseif ($bkChoice -eq 'b') {
+                                Write-Host ""
+                                Write-Host "$($script:BoxMargin)This REPLACES your current library. Any squig.link EQs you added" -ForegroundColor Red
+                                Write-Host "$($script:BoxMargin)are deleted, and the failed backup means they cannot be restored." -ForegroundColor Red
+                                Write-Host "$($script:BoxMargin)Type 'yes' to replace it, or anything else to go back: " -ForegroundColor Yellow -NoNewline
+                                if ("$(Read-Host)" -eq 'yes') {
+                                    $backupDest = $null
+                                    $proceed    = $true
+                                    $menuOpen   = $false
+                                }
+                            }
+                        }
+                    }
+
+                    if (-not $proceed) { continue backupRetry }
+
+                    # Guarded because [b] can reach this after a FAILED backup, and the
+                    # commonest reason a backup fails is a file in the library being
+                    # locked -- the very same lock then breaks the lay-down below. The
+                    # wipe is already under way at that point, so an unhandled throw
+                    # here would exit the installer on a half-cleared library. Send it
+                    # back to the menu instead: this function must never let a hard
+                    # failure escape silently, and a crash is not "surfacing" it.
+                    try {
+                        New-Item -ItemType Directory -Path $libRoot -Force | Out-Null
+                        # Nuke the existing library so only the fresh release remains.
+                        Get-ChildItem -Path $libRoot -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+                        # Lay down the fresh release.
+                        Copy-Item -Path (Join-Path $srcRoot '*') -Destination $libRoot -Recurse -Force
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host "$($script:BoxMargin)Could not write the new library: $($_.Exception.GetType().Name)" -ForegroundColor Red
+                        Write-Host "$($script:BoxMargin)$($_.Exception.Message)" -ForegroundColor DarkGray
+                        Write-Host "$($script:BoxMargin)Close anything using the library folder (E-APO editor, Peace," -ForegroundColor Yellow
+                        Write-Host "$($script:BoxMargin)HeSuVi, a text editor) and choose [r]." -ForegroundColor Yellow
+                        continue backupRetry
+                    }
                     $fileCount = @(Get-ChildItem -LiteralPath $libRoot -Recurse -File -ErrorAction SilentlyContinue).Count
 
                     Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
@@ -4313,11 +4804,6 @@ function Install-ArtTuneLibrary {
                     Write-Host "$($script:BoxMargin)ArtTuneDB library installed ($fileCount files)." -ForegroundColor Green
                     return $true
                 }
-
-                # Backup failed. Leave the existing library exactly as it is: the user's
-                # squig.link EQs live inside the tree the nuke would clear, and there
-                # would be nothing to restore them from. Fall through to the retry menu.
-                Write-Host "$($script:BoxMargin)Backup failed; your existing library was left untouched." -ForegroundColor Yellow
             }
             Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
         }

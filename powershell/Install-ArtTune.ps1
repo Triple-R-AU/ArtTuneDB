@@ -4502,8 +4502,8 @@ function Test-LibraryBackupPreflight {
     .SYNOPSIS
         Fails fast, BEFORE the download, on the backup problems a retry cannot fix.
     .DESCRIPTION
-        Both checks catch failures that would otherwise surface only after a 1 MB
-        fetch, as a mid-copy error, with the real cause buried.
+        Every check here catches a failure that would otherwise surface only after a
+        1 MB fetch, as a mid-copy error, with the real cause buried.
 
         MAX_PATH is computed PER FILE as <root>\Art Tune Backups\library-<stamp>\ plus
         that file's path RELATIVE to the library root, taking the max over the set.
@@ -4555,6 +4555,30 @@ function Test-LibraryBackupPreflight {
         Write-Verbose "Free-space check skipped: $($_.Exception.GetType().Name)."
     }
 
+    # -- free space for the STAGED copy, on the library's own drive ------------
+    # The lay-down stages the new tree as a sibling of library\ before swapping it
+    # in, so peak usage on THIS drive is two copies. Different drive from the backup
+    # in general, hence a second probe rather than a bigger number above.
+    #
+    # PROXY, not the real figure: the incoming release has not been downloaded yet,
+    # so the existing library's size stands in for it. The authoritative check is in
+    # Invoke-AtomicLibraryLayDown, which measures the extracted payload exactly and
+    # also covers the fresh-install path that skips this pre-flight entirely.
+    try {
+        $stageDriveRoot = [IO.Path]::GetPathRoot($LibraryPath)
+        $stageDrive     = New-Object IO.DriveInfo($stageDriveRoot)
+        # Same IsReady-first shape as above, for the same reason. Do not collapse it.
+        $stageFree = if ($stageDrive.IsReady) { $stageDrive.AvailableFreeSpace } else { $null }
+        if ($null -ne $stageFree -and $stageFree -lt $needed) {
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)Not enough free space to install the new library." -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)Needs about $([math]::Round($needed / 1MB, 1)) MB on $stageDriveRoot, $([math]::Round($stageFree / 1MB, 1)) MB is free." -ForegroundColor DarkGray
+            return $false
+        }
+    } catch {
+        Write-Verbose "Staging free-space check skipped: $($_.Exception.GetType().Name)."
+    }
+
     # -- MAX_PATH, per file ---------------------------------------------------
     # "library-yyyy-MM-dd_HHmmss" is 25 characters; +2 for the two separators.
     $prefixLength = $BackupRoot.TrimEnd('\').Length + 2 + 25
@@ -4576,15 +4600,479 @@ function Test-LibraryBackupPreflight {
     return $true
 }
 
+function Get-LibraryLockReport {
+    <#
+    .SYNOPSIS
+        After a refused lay-down, names the files that are open and the E-APO
+        ecosystem processes that are running. Diagnostic ONLY -- nothing is gated on
+        the answer.
+    .DESCRIPTION
+        MEASURED (Step 0, PS 5.1.26100.8875 / Win 11 26100, NTFS): a handle on ANY
+        file inside a directory blocks [IO.Directory]::Move unconditionally. All six
+        share modes failed -- None, Read, ReadWrite, Delete, Read|Delete,
+        ReadWrite|Delete.
+
+        MEASURED AND CORRECTED: FILE_SHARE_DELETE was first read as the deciding bit,
+        because a handle on the DIRECTORY carrying that bit did not block. The
+        isolation test disproved it for child handles -- all three *-del file modes
+        still failed. It decides only for a handle on the directory itself. Do not
+        reintroduce "share-delete readers are harmless" here; it was measured false.
+
+        A FileShare.None probe therefore detects exactly what blocks the rename: any
+        handle at all. It is the same probe the Step 0 harness used to prove its own
+        locks were real.
+
+        This runs only AFTER a rename has already been refused, and that is what
+        makes the TOCTOU race harmless -- a stale answer costs an imprecise message,
+        not a wrong decision. A pre-flight of this same shape was considered for the
+        [b] path and dropped for exactly the reason that does not apply here.
+    .OUTPUTS
+        pscustomobject @{ Files; More; Processes }
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $locked = @()
+    $more   = 0
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        $stream = $null
+        try {
+            $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        }
+        catch {
+            # Refused open == a handle exists. The exception is the signal itself, so
+            # there is nothing to record beyond which file it was.
+            # Reported relative to the library folder: the absolute path is ~90
+            # characters of Program Files boilerplate that buries the one part the
+            # user needs to recognise.
+            if ($locked.Count -lt 5) {
+                $rel = $file.FullName
+                if ($rel.Length -gt $Path.Length) {
+                    $rel = Join-Path (Split-Path $Path -Leaf) $rel.Substring($Path.Length).TrimStart('\')
+                }
+                $locked += $rel
+            } else {
+                $more++
+            }
+        }
+        finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+
+    # Same names Stop-EAPOEcosystemProcesses works from, so the two cannot drift.
+    $running = @()
+    foreach ($name in @('Peace', 'HeSuVi', 'Configurator', 'DeviceSelector')) {
+        if (@(Get-Process -Name $name -ErrorAction SilentlyContinue).Count -gt 0) { $running += $name }
+    }
+    $eapoPath = Join-Path $env:ProgramFiles "EqualizerAPO"
+    $editors = @(Get-Process -Name 'Editor' -ErrorAction SilentlyContinue |
+        Where-Object {
+            try { $_.Path -and $_.Path.StartsWith($eapoPath, [System.StringComparison]::OrdinalIgnoreCase) }
+            catch { $false }
+        })
+    if ($editors.Count -gt 0) { $running += 'E-APO Editor' }
+
+    return [pscustomobject]@{ Files = $locked; More = $more; Processes = $running }
+}
+
+function Restore-InterruptedLibrarySwap {
+    <#
+    .SYNOPSIS
+        Recovers or clears the transient folders an interrupted lay-down leaves
+        behind. RESTORES first, deletes second.
+    .DESCRIPTION
+        The lay-down renames library\ -> library.old-<stamp>\ and then
+        library.new-<stamp>\ -> library\. A crash between those two renames leaves the
+        real library under library.old-<stamp>\ with no library\ at all. That tree
+        holds the user's squig.link EQs and is the only irreplaceable thing in play,
+        so it is NEVER deleted while library\ is missing -- it is put back.
+
+        library.new-<stamp>\ is a staged copy that never went live. Always safe to
+        delete: it came from the release zip and is re-downloadable.
+
+        Runs at the TOP of Install-ArtTuneLibrary, before this run stages anything, so
+        every folder matching these patterns is by definition from an earlier run.
+
+        Concurrency is NOT handled, and that is stated rather than quietly assumed:
+        two installer instances would race here. They already share $script:TempPath
+        and kill each other's processes, so single-instance is a pre-existing
+        assumption of the whole script. Solving it here alone would be worse than
+        naming it.
+
+        A library kept deliberately (the [b] path) is named library-previous-<stamp>,
+        OUTSIDE both patterns, so a tree the user was told to go and collect can never
+        be swept away by this function.
+    #>
+    param([Parameter(Mandatory)][string]$LibraryRoot)
+
+    $parent = Split-Path $LibraryRoot -Parent
+    if (-not (Test-Path -LiteralPath $parent)) { return }
+
+    $all = @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)
+    # Newest stamp first. "yyyy-MM-dd_HHmmss" sorts lexically, so this is chronological.
+    $olds = @($all | Where-Object { $_.Name -like 'library.old-*' } | Sort-Object Name -Descending)
+    $news = @($all | Where-Object { $_.Name -like 'library.new-*' })
+    if ($olds.Count -eq 0 -and $news.Count -eq 0) { return }
+
+    $libExisted = Test-Path -LiteralPath $LibraryRoot
+
+    # -- restore first --------------------------------------------------------
+    if (-not $libExisted -and $olds.Count -gt 0) {
+        $survivor = $olds[0]
+        $restored = $false
+        try {
+            [IO.Directory]::Move($survivor.FullName, $LibraryRoot)
+            $restored = $true
+        }
+        catch {
+            # Called through PowerShell method syntax, the real IOException arrives
+            # wrapped in a MethodInvocationException. Unwrap or the type is useless.
+            $err = $_.Exception
+            if ($err.InnerException) { $err = $err.InnerException }
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)A previous run was interrupted. Your library is currently at:" -ForegroundColor Red
+            Write-Host "$($script:BoxMargin)$($survivor.FullName)" -ForegroundColor White
+            Write-Host "$($script:BoxMargin)It could not be moved back automatically ($($err.GetType().Name))." -ForegroundColor DarkGray
+            Write-Host "$($script:BoxMargin)Rename that folder to 'library' to restore it, then run this again." -ForegroundColor Yellow
+        }
+        if (-not $restored) { return }
+
+        Write-Host ""
+        Write-Host "$($script:BoxMargin)A previous run was interrupted mid-install. Your library has been put" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)back from $($survivor.Name) -- nothing was lost." -ForegroundColor Yellow
+        $olds = @($olds | Select-Object -Skip 1)
+    }
+
+    # -- then sweep -----------------------------------------------------------
+    foreach ($dir in $news) {
+        Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($olds.Count -eq 0) { return }
+    if ($libExisted) {
+        # library\ was already in place, so these are spent copies of a swap that
+        # finished. Safe to clear.
+        foreach ($dir in $olds) {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        # We just restored one. Anything still here predates it and may hold an even
+        # older library -- reported, never deleted on a guess.
+        Write-Host "$($script:BoxMargin)Older leftover folders were kept: $(($olds | ForEach-Object { $_.Name }) -join ', ')" -ForegroundColor DarkGray
+    }
+}
+
+function Invoke-AtomicLibraryLayDown {
+    <#
+    .SYNOPSIS
+        Stages the new library beside the live one, verifies it, then swaps it in with
+        two renames. Never leaves a partial library.
+    .DESCRIPTION
+        Replaces a nuke-then-copy that left 89 of 92 files and no backup when a source
+        file was locked. The sequence:
+
+          S1  ensure the ArtTuneDB root exists (and PROVE it)
+          S2  stage    $SourceRoot\* -> library.new-<stamp>\
+          S3  verify   staged tree against $SourceRoot, exactly
+          S4  R1       library\           -> library.old-<stamp>\   WINDOW OPENS
+          S5  R2       library.new-<stamp>\ -> library\             window closes
+          S6  dispose of library.old-<stamp>\
+
+        THE SWAP USES [IO.Directory]::Move ONLY. Move-Item is disqualified and must
+        not be substituted for it, however much more PowerShell-ish it looks.
+        Measured over 28 cases: [IO.Directory]::Move produced 0 partial results, and
+        every failure left the source intact and the destination absent. Move-Item, on
+        the same locked-file cases, left 88 FILES IN THE SOURCE AND 4 IN THE
+        DESTINATION -- it walks the tree item by item through the FileSystem provider,
+        which is the exact disease this function exists to cure.
+
+        This is NOT lock-immune, and is not meant to be. A handle on any file inside
+        library\ refuses R1 outright (see Get-LibraryLockReport). Refusal is the
+        expected common path: it costs the install, never the library.
+
+        S4 is skipped when library\ does not exist (fresh install), so that path has
+        no dangerous window at all.
+    .PARAMETER PreserveOld
+        Keep the replaced library as library-previous-<stamp> instead of deleting it.
+        Used when no successful backup was taken this run, so the [b] path stops being
+        a one-way door.
+    .OUTPUTS
+        pscustomobject @{ Ok; FailedStep; Reason; Lock; PreservedPath; FileCount }
+        FailedStep is one of root/space/stage/verify/swap/rollback.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$LibraryRoot,
+        [switch]$PreserveOld
+    )
+
+    # Same stamp format as the backup folders (:2271), so the two read alike on disk.
+    $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
+    $root  = Split-Path $LibraryRoot -Parent
+    $stage = Join-Path $root "library.new-$stamp"
+    $old   = Join-Path $root "library.old-$stamp"
+
+    $result = [pscustomobject]@{
+        Ok            = $false
+        FailedStep    = ''
+        Reason        = ''
+        Lock          = $null
+        PreservedPath = $null
+        FileCount     = 0
+    }
+
+    # -- S1: the root must really exist ---------------------------------------
+    # New-Item -Force is not trusted here. Through a dangling reparse point it
+    # reports success, returns zero objects, throws nothing even under
+    # $ErrorActionPreference = 'Stop', and creates NOTHING -- the defect documented at
+    # Get-ArtTuneBackupRoot. [IO.Directory]::Exists is the only thing that catches it.
+    try {
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+    }
+    catch {
+        $result.FailedStep = 'root'
+        $result.Reason     = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        return $result
+    }
+    if (-not [IO.Directory]::Exists($root)) {
+        $result.FailedStep = 'root'
+        $result.Reason     = "The folder could not be created: $root"
+        return $result
+    }
+
+    # -- source size, and the authoritative free-space check ------------------
+    $srcFiles = @(Get-ChildItem -LiteralPath $SourceRoot -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $srcBytes = [int64]0
+    if ($srcFiles.Count -gt 0) {
+        $srcSum = ($srcFiles | Measure-Object -Property Length -Sum).Sum
+        if ($null -ne $srcSum) { $srcBytes = [int64]$srcSum }
+    }
+    try {
+        $driveRoot = [IO.Path]::GetPathRoot($root)
+        $drive     = New-Object IO.DriveInfo($driveRoot)
+        # IsReady first, exactly as Test-LibraryBackupPreflight does it: on a not-ready
+        # drive AvailableFreeSpace yields nothing rather than throwing, and a null
+        # compared as 0 would report a healthy machine as full.
+        $freeBytes = if ($drive.IsReady) { $drive.AvailableFreeSpace } else { $null }
+        if ($null -ne $freeBytes -and $freeBytes -lt $srcBytes) {
+            $result.FailedStep = 'space'
+            $result.Reason     = "Needs $([math]::Round($srcBytes / 1MB, 1)) MB on $driveRoot, $([math]::Round($freeBytes / 1MB, 1)) MB is free."
+            return $result
+        }
+    }
+    catch {
+        Write-Verbose "Lay-down free-space check skipped: $($_.Exception.GetType().Name)."
+    }
+
+    # -- S2: stage ------------------------------------------------------------
+    try {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        Copy-Item -Path (Join-Path $SourceRoot '*') -Destination $stage -Recurse -Force
+    }
+    catch {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        $result.FailedStep = 'stage'
+        $result.Reason     = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        return $result
+    }
+
+    # -- S3: verify -----------------------------------------------------------
+    # -ne, NOT the -lt the backup verify uses. That -lt exists because the backup's
+    # source is the LIVE library\, where Get-ChildItem -Recurse refuses to descend a
+    # user-made junction while Copy-Item -Recurse copies straight through it, so the
+    # destination legitimately ends up larger. This source is Expand-Archive output,
+    # and zip extraction creates no reparse points -- measured: 0 in the payload. So
+    # the counts must match exactly, and exact comparison also catches a surplus that
+    # -lt would wave through.
+    $stageFiles = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $stageBytes = [int64]0
+    if ($stageFiles.Count -gt 0) {
+        $stageSum = ($stageFiles | Measure-Object -Property Length -Sum).Sum
+        if ($null -ne $stageSum) { $stageBytes = [int64]$stageSum }
+    }
+    if ($stageFiles.Count -ne $srcFiles.Count -or $stageBytes -ne $srcBytes) {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        $result.FailedStep = 'verify'
+        $result.Reason     = "staged $($stageFiles.Count) of $($srcFiles.Count) files, $stageBytes of $srcBytes bytes."
+        return $result
+    }
+
+    # -- S4: R1 ---------------------------------------------------------------
+    $hadLibrary = Test-Path -LiteralPath $LibraryRoot
+    if ($hadLibrary) {
+        try {
+            [IO.Directory]::Move($LibraryRoot, $old)
+        }
+        catch {
+            # Nothing has been touched yet. The staged tree goes, library\ stays.
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            $err = $_.Exception
+            if ($err.InnerException) { $err = $err.InnerException }
+            $result.FailedStep = 'swap'
+            $result.Reason     = "$($err.GetType().Name): $($err.Message)"
+            $result.Lock       = Get-LibraryLockReport -Path $LibraryRoot
+            return $result
+        }
+    }
+
+    # -- S5: R2. THE DANGEROUS WINDOW IS OPEN FROM HERE ------------------------
+    # Retried because Step 0 found no case where R1 succeeds and R2/rollback fails:
+    # the locks that would threaten this window refuse R1 outright, so anything
+    # arriving here was acquired INSIDE the window and is transient by nature. Three
+    # attempts, then stop -- never spin.
+    $moved = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $moved; $attempt++) {
+        try {
+            [IO.Directory]::Move($stage, $LibraryRoot)
+            $moved = $true
+        }
+        catch {
+            Write-Verbose "Lay-down R2 attempt $attempt failed: $($_.Exception.GetType().Name)."
+            Start-Sleep -Milliseconds 400
+        }
+    }
+
+    if (-not $moved) {
+        $rolled  = $false
+        $rollErr = $null
+        if ($hadLibrary) {
+            for ($attempt = 1; $attempt -le 3 -and -not $rolled; $attempt++) {
+                try {
+                    [IO.Directory]::Move($old, $LibraryRoot)
+                    $rolled = $true
+                }
+                catch {
+                    $rollErr = $_.Exception
+                    if ($rollErr.InnerException) { $rollErr = $rollErr.InnerException }
+                    Start-Sleep -Milliseconds 400
+                }
+            }
+        }
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+        if ($rolled -or -not $hadLibrary) {
+            # Rolled back, or there was never a library to lose. Nothing lost either way.
+            $result.FailedStep = 'swap'
+            $result.Reason     = 'The new library could not be moved into place.'
+        }
+        else {
+            # The one genuinely bad state. Never seen in 28 measured cases, but a handle
+            # taken inside the window is a real race, so it is handled rather than assumed away.
+            $result.FailedStep    = 'rollback'
+            $result.PreservedPath = $old
+            $result.Reason        = if ($rollErr) { "$($rollErr.GetType().Name): $($rollErr.Message)" } else { 'The library could not be moved back.' }
+        }
+        return $result
+    }
+
+    # -- S6: dispose of the replaced tree -------------------------------------
+    if ($hadLibrary) {
+        if ($PreserveOld) {
+            $preserved = Join-Path $root "library-previous-$stamp"
+            try {
+                [IO.Directory]::Move($old, $preserved)
+                $result.PreservedPath = $preserved
+            }
+            catch {
+                # Could not rename it aside. Name where it actually is instead of
+                # deleting what may be the only surviving copy.
+                Write-Verbose "Could not rename the replaced library aside: $($_.Exception.GetType().Name)."
+                $result.PreservedPath = $old
+            }
+        }
+        else {
+            # Non-fatal. A tree left here is picked up by Restore-InterruptedLibrarySwap
+            # on the next run, and the swap itself has already succeeded.
+            Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $result.Ok        = $true
+    $result.FileCount = @(Get-ChildItem -LiteralPath $LibraryRoot -Recurse -File -ErrorAction SilentlyContinue).Count
+    return $result
+}
+
+function Write-LibraryLayDownFailure {
+    <#
+    .SYNOPSIS
+        Renders a failed lay-down. The refusal case is the COMMON path, not an error,
+        and is worded accordingly.
+    .DESCRIPTION
+        The raw exception is deliberately not echoed as the cause. R1's message is
+        "Access to the path '...\library' is denied.", which names the DIRECTORY, reads
+        as a permissions problem, and points at a path the user can see is fine. The
+        real cause is a handle on a file inside it.
+    #>
+    param([Parameter(Mandatory)]$Result)
+
+    Write-Host ""
+    if ($Result.FailedStep -eq 'rollback') {
+        Write-Host "$($script:BoxMargin)The install was interrupted at the worst moment and your library is" -ForegroundColor Red
+        Write-Host "$($script:BoxMargin)currently in this folder:" -ForegroundColor Red
+        Write-Host "$($script:BoxMargin)$($Result.PreservedPath)" -ForegroundColor White
+        Write-Host "$($script:BoxMargin)Nothing was deleted. Rename that folder to 'library' to put it back --" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)or just run this installer again and it will do it for you." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "$($script:BoxMargin)Your library was not changed." -ForegroundColor Green
+    Write-Host ""
+
+    if ($Result.FailedStep -eq 'swap') {
+        Write-Host "$($script:BoxMargin)Something on this PC is still using it, so the new library could not" -ForegroundColor Yellow
+        Write-Host "$($script:BoxMargin)be put in place. Nothing was deleted -- your library is exactly as it was." -ForegroundColor DarkGray
+
+        if ($Result.Lock -and $Result.Lock.Files.Count -gt 0) {
+            Write-Host ""
+            Write-Host "$($script:BoxMargin)  Still in use:" -ForegroundColor Yellow
+            foreach ($f in $Result.Lock.Files) {
+                Write-Host "$($script:BoxMargin)    $f" -ForegroundColor DarkGray
+            }
+            if ($Result.Lock.More -gt 0) {
+                Write-Host "$($script:BoxMargin)    (and $($Result.Lock.More) more)" -ForegroundColor DarkGray
+            }
+        }
+
+        # ALWAYS reached, whether or not a file was named. Naming the file without
+        # saying what to do about it leaves the user with a path and no next step --
+        # and the process list is empty whenever the holder is something we do not
+        # recognise, which is exactly when the generic advice matters most.
+        Write-Host ""
+        if ($Result.Lock -and $Result.Lock.Processes.Count -gt 0) {
+            Write-Host "$($script:BoxMargin)  Close these, then choose [r]:" -ForegroundColor Yellow
+            foreach ($p in $Result.Lock.Processes) {
+                Write-Host "$($script:BoxMargin)    $p" -ForegroundColor White
+            }
+        } else {
+            Write-Host "$($script:BoxMargin)  Close Peace, HeSuVi, the E-APO editor, or any text editor or Explorer" -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)  window open on the library folder, then choose [r]." -ForegroundColor Yellow
+        }
+        return
+    }
+
+    switch ($Result.FailedStep) {
+        'space'  { Write-Host "$($script:BoxMargin)There is not enough free disk space to install it. $($Result.Reason)" -ForegroundColor Yellow }
+        'verify' { Write-Host "$($script:BoxMargin)The downloaded library did not copy completely, so it was discarded." -ForegroundColor Yellow
+                   Write-Host "$($script:BoxMargin)$($Result.Reason)" -ForegroundColor DarkGray }
+        'stage'  { Write-Host "$($script:BoxMargin)The new library could not be written next to your existing one." -ForegroundColor Yellow
+                   Write-Host "$($script:BoxMargin)$($Result.Reason)" -ForegroundColor DarkGray }
+        default  { Write-Host "$($script:BoxMargin)The install folder could not be prepared." -ForegroundColor Yellow
+                   Write-Host "$($script:BoxMargin)$($Result.Reason)" -ForegroundColor DarkGray }
+    }
+}
+
 function Install-ArtTuneLibrary {
     <#
     .SYNOPSIS
         Fetches the latest ArtTuneDB library release (.zip asset) and lays it down in
         the canonical ArtTuneDB root, automating the old manual "drag the library
         folder into E-APO config" ritual. Any existing library is backed up to a dated
-        folder (unless -SkipBackup), then wiped and replaced with the fresh release
-        (backup-then-nuke; no state file). The library is load-bearing, so hard failures
-        surface with a retry affordance (never silently pass).
+        folder (unless -SkipBackup), then replaced by an atomic stage-verify-swap
+        (Invoke-AtomicLibraryLayDown; no state file). The library is load-bearing, so
+        hard failures surface with a retry affordance (never silently pass).
     .PARAMETER SkipBackup
         Skip the dated backup of the existing library. Used by the Setup fresh-install
         path when there is no real library worth preserving.
@@ -4592,6 +5080,13 @@ function Install-ArtTuneLibrary {
     param([switch]$SkipBackup)
 
     $libRoot = Join-Path $script:ArtTuneDBRoot "library"
+
+    # BEFORE anything else, including the pre-flight. An earlier run killed between
+    # the two renames leaves the real library under library.old-<stamp>\ with no
+    # library\ at all, and every check below would then read a healthy machine as
+    # having no library. This restores it. Runs before this run stages anything, so
+    # whatever it finds is by definition not ours.
+    Restore-InterruptedLibrarySwap -LibraryRoot $libRoot
 
     # Set by the [r] affordance below so the next backup attempt re-probes the root
     # instead of reusing a cached failure. Declared here because StrictMode faults on
@@ -4679,20 +5174,31 @@ function Install-ArtTuneLibrary {
                 # Normalize to the full/long path form so Copy-Item has a valid source.
                 $srcRoot = (Get-Item -LiteralPath $srcRoot).FullName
 
-                # --- Back up any existing library (dated), then wipe and replace ---
+                # --- Back up any existing library (dated), then swap in the new one ---
                 # This inner loop is the fix for the reported dead end. The download
                 # and extract above have already succeeded, so retrying THEM cannot
                 # clear a filesystem problem -- yet re-downloading was the only thing
                 # the old menu offered, which made a failed backup an inescapable loop.
                 # Everything below retries the BACKUP, and the staging tree is kept so
                 # no option here costs another transfer.
+                #
+                # HOISTED out of the loop on purpose. A refused lay-down leaves library\
+                # byte-identical (the swap is atomic), so a backup taken on an earlier
+                # pass is still a faithful copy of exactly the same tree. Re-running it
+                # per retry would pile up dated duplicates -- and with a lock now the
+                # expected reason to retry, that pile would be the common case.
+                $backupDest   = $null
+                $backupWaived = $false
                 :backupRetry while ($true) {
 
-                    $backupDest   = $null
                     $backupFailed = $false
                     $proceed      = $false
 
-                    if ($SkipBackup -or -not (Test-Path $libRoot)) {
+                    if ($SkipBackup -or $backupWaived -or -not (Test-Path $libRoot)) {
+                        $proceed = $true
+                    } elseif ($backupDest -and -not ($backupDest -is [bool]) -and (Test-Path -LiteralPath "$backupDest")) {
+                        # Already have one from an earlier pass of this loop, and library\
+                        # is provably unchanged since. Reuse it.
                         $proceed = $true
                     } else {
                         # -is [bool] rather than -eq $false: a returned path string
@@ -4761,8 +5267,13 @@ function Install-ArtTuneLibrary {
                                 Write-Host "$($script:BoxMargin)Type 'yes' to replace it, or anything else to go back: " -ForegroundColor Yellow -NoNewline
                                 if ("$(Read-Host)" -eq 'yes') {
                                     $backupDest = $null
-                                    $proceed    = $true
-                                    $menuOpen   = $false
+                                    # Remembered, so a later lay-down retry does not
+                                    # re-ask a question already answered. It also keeps
+                                    # $backupDest null, which is what turns PreserveOld
+                                    # on and stops [b] being a one-way door.
+                                    $backupWaived = $true
+                                    $proceed      = $true
+                                    $menuOpen     = $false
                                 }
                             }
                         }
@@ -4770,38 +5281,82 @@ function Install-ArtTuneLibrary {
 
                     if (-not $proceed) { continue backupRetry }
 
-                    # Guarded because [b] can reach this after a FAILED backup, and the
-                    # commonest reason a backup fails is a file in the library being
-                    # locked -- the very same lock then breaks the lay-down below. The
-                    # wipe is already under way at that point, so an unhandled throw
-                    # here would exit the installer on a half-cleared library. Send it
-                    # back to the menu instead: this function must never let a hard
-                    # failure escape silently, and a crash is not "surfacing" it.
-                    try {
-                        New-Item -ItemType Directory -Path $libRoot -Force | Out-Null
-                        # Nuke the existing library so only the fresh release remains.
-                        Get-ChildItem -Path $libRoot -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                    # Atomic: stage beside library\, verify, then swap in with two
+                    # renames. It can REFUSE -- any process holding a file in library\
+                    # open blocks the rename -- but it can never half-finish, so the
+                    # failure paths below all leave the library exactly as it was.
+                    #
+                    # PreserveOld keeps the replaced tree as library-previous-<stamp>
+                    # whenever no backup was taken this run. That is the [b] path, where
+                    # the backup failed and this would otherwise be a one-way door.
+                    $noBackupTaken = (-not $backupDest) -or ($backupDest -is [bool])
 
-                        # Lay down the fresh release.
-                        Copy-Item -Path (Join-Path $srcRoot '*') -Destination $libRoot -Recurse -Force
+                    # Still guarded. Not for a half-cleared library -- that state no
+                    # longer exists -- but because this function must never let a hard
+                    # failure escape silently, and a crash is not "surfacing" it.
+                    $layDown = $null
+                    try {
+                        $layDown = Invoke-AtomicLibraryLayDown -SourceRoot $srcRoot -LibraryRoot $libRoot -PreserveOld:$noBackupTaken
                     }
                     catch {
                         Write-Host ""
-                        Write-Host "$($script:BoxMargin)Could not write the new library: $($_.Exception.GetType().Name)" -ForegroundColor Red
+                        Write-Host "$($script:BoxMargin)Could not install the new library: $($_.Exception.GetType().Name)" -ForegroundColor Red
                         Write-Host "$($script:BoxMargin)$($_.Exception.Message)" -ForegroundColor DarkGray
-                        Write-Host "$($script:BoxMargin)Close anything using the library folder (E-APO editor, Peace," -ForegroundColor Yellow
-                        Write-Host "$($script:BoxMargin)HeSuVi, a text editor) and choose [r]." -ForegroundColor Yellow
                         continue backupRetry
                     }
-                    $fileCount = @(Get-ChildItem -LiteralPath $libRoot -Recurse -File -ErrorAction SilentlyContinue).Count
+
+                    if (-not $layDown.Ok) {
+                        Write-LibraryLayDownFailure -Result $layDown
+
+                        # A MENU, not a bare retry. The message above tells the user to
+                        # close something and choose [r], and looping straight back would
+                        # spin on the same lock forever without ever offering it -- fast,
+                        # silent, and impossible to escape. Refusal is now the expected
+                        # common path, so this is the path that has to behave.
+                        $layMenuOpen = $true
+                        while ($layMenuOpen) {
+                            Write-Host ""
+                            $null = Write-CenteredBlock @(
+                                @{ Text = '[r] Try again - I closed what was using it'; Color = 'Yellow' }
+                                @{ Text = '[o] Show me the library folder'; Color = 'White' }
+                                @{ Text = '[s] Skip - keep my current library as it is'; Color = 'DarkGray' }
+                            )
+                            Write-Host ""
+                            Write-Host "$($script:BoxMargin)" -NoNewline
+                            Write-Host "Choice: " -ForegroundColor Yellow -NoNewline
+                            $layChoice = "$(Read-Host)".ToLower()
+
+                            if ($layChoice -eq 'r') {
+                                $layMenuOpen = $false
+                            }
+                            elseif ($layChoice -eq 's') {
+                                Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+                                Write-Host "$($script:BoxMargin)Skipped. Your library was not changed." -ForegroundColor Yellow
+                                return $false
+                            }
+                            elseif ($layChoice -eq 'o') {
+                                # After a failed rollback the library is NOT at $libRoot,
+                                # so point at where it actually is.
+                                $showPath = if ($layDown.PreservedPath) { $layDown.PreservedPath } else { $libRoot }
+                                Write-Host ""
+                                Write-Host "$($script:BoxMargin)Your library is here:" -ForegroundColor Cyan
+                                Write-Host "$($script:BoxMargin)$showPath" -ForegroundColor White
+                                Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$showPath`""
+                            }
+                        }
+                        continue backupRetry
+                    }
 
                     Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
                     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 
-                    if ($backupDest) {
+                    if ($backupDest -and -not ($backupDest -is [bool])) {
                         Write-Host "$($script:BoxMargin)Previous library backed up to: $backupDest" -ForegroundColor DarkGray
                     }
-                    Write-Host "$($script:BoxMargin)ArtTuneDB library installed ($fileCount files)." -ForegroundColor Green
+                    if ($layDown.PreservedPath) {
+                        Write-Host "$($script:BoxMargin)Your previous library was kept here: $($layDown.PreservedPath)" -ForegroundColor Cyan
+                    }
+                    Write-Host "$($script:BoxMargin)ArtTuneDB library installed ($($layDown.FileCount) files)." -ForegroundColor Green
                     return $true
                 }
             }
@@ -4994,8 +5549,8 @@ function Write-InitialConfig {
     #
     # SEEDED ONCE, NEVER OVERWRITTEN. config.txt is rewritten on every run; the user's
     # boost value must survive that, and this lane has no picker UI to restore it from.
-    # It sits at the ArtTuneDB ROOT, outside library\, so Install-ArtTuneLibrary's
-    # backup-then-nuke of library\ cannot take it with it.
+    # It sits at the ArtTuneDB ROOT, outside library\, so Install-ArtTuneLibrary
+    # replacing library\ wholesale cannot take it with it.
     #
     # The Preamp line ships LIVE at 0 dB (a genuine no-op), and so does the config.txt
     # Include. 0 dB is already the off state, so there is nothing to uncomment in either

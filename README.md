@@ -156,17 +156,22 @@ The `measurements/` folder holds frequency response data for headphones not wide
 
 BO7 V5 is the first 16-channel release. The ATK Spatial Engine runs the whole chain natively on the **Art Tune +** endpoint, so **there is no HeSuVi stage** and no `_pre`/`_post` pair. You point one `Include:` line at one config file.
 
-V5 ships 20 configs: five tuning styles, each at four self-gun levels.
+V5 ships 40 configs: eight tuning styles, each at five self-gun levels. Start with **Classic+** at **Ultra Low**: `BO7_V5_16ch_ClassicPlus-UltraLoGun.txt`.
 
 | Style | Character |
 |-------|-----------|
+| **Classic+** (default, new) | Classic with more footstep lift. Distant steps come through louder, close ones are no longer held back |
+| **Classic** (new) | Slowest leveller timing, the least audible processing. Closest to the old Loudness Equalization feel |
+| **Open** (new) | The least filtered. Built on Balanced, so mid-level sound comes up harder and less bright content is held back |
 | **Full** | Combat ducking off, footsteps lifted, full dynamics |
-| **Capped** | Full with a soft ceiling that rounds off the loudest peaks |
-| **Balanced** | Full's footstep lift with combat control kept on |
-| **Competitive** | Maximum footstep detail |
-| **Immersive** | The easy listen. Guns tamed deepest, smoothest presence |
+| **Competitive** (experimental) | Maximum footstep detail |
+| **Capped** (deprecated) | Full with a hard output clamp. Kept for anyone already using it |
+| **Immersive** (deprecated) | Guns tamed deepest. Kept for anyone already using it; Classic covers the same ground |
+| **Balanced** (deprecated) | Full's footstep lift with combat control kept on. Kept for anyone already using it; Open replaces it |
 
-Each style has a **self gun level** of `StockGun`, `LoGun`, `MedGun` or `HiGun`, controlling how much of your own gunfire stays in the mix. Files are named `BO7_V5_16ch_<Style>-<Level>Gun.txt`.
+Deprecated styles still ship and still work. Nothing was removed.
+
+Each style has a **self gun level** of `StockGun`, `LoGun`, `MedGun`, `HiGun` or `UltraLoGun`, controlling how much of your own gunfire stays in the mix. Ultra Low pushes your own gun to the engine's limit; the room reflection after a shot is not ducked at that tier, so if the ring-out distracts you, use Low. Files are named `BO7_V5_16ch_<Style>-<Level>Gun.txt`, with Classic+ spelled `ClassicPlus`.
 
 `library/BO7/V5/Choose a 16ch Tune.txt` describes every combination and names the exact file to use. Read that before picking.
 
@@ -242,7 +247,7 @@ One tune file, no HeSuVi:
 # ---- 16ch profile (Art Tune +) ----
 Device: Art Tune + VB-Audio Virtual Cable {guid}
 # 16ch TUNE
-Include: ArtTuneDB\library\BO7\V5\BO7_V5_16ch_Full-LoGun.txt
+Include: ArtTuneDB\library\BO7\V5\BO7_V5_16ch_ClassicPlus-UltraLoGun.txt
 # EQ
 Include: ArtTuneDB\library\BO7\V5\eq\YourHeadphone_BO7_V5.txt
 # OUTPUT BOOST

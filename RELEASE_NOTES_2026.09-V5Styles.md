@@ -32,10 +32,37 @@ your own footsteps and gunfire are handled on every style.
   Cielo.
 - All other games and versions are unchanged.
 
+## Updating an existing install
+
+Run the setup script and pick **[3] Redownload Library**:
+
+```
+irm artiswar.io/tools/ArtTuneGuided | iex
+```
+
+It backs up your current library first, including any squig.link EQs you
+saved in the `eq\` folders, and prints where the backup went (normally
+`Documents\Art Tune Backups\`). Copy your EQ files back into the matching
+`eq\` folder afterwards, or the EQ line in your `config.txt` will point at a
+file that is no longer there.
+
+## Installer v1.3
+
+- Uninstall no longer removes your library without a working backup. If no
+  backup can be written it asks before touching anything, and it only says
+  your library was backed up when a backup really exists.
+- [3] Redownload Library can no longer leave a half-installed library. The new
+  library is copied and checked first, then swapped in. If a file is in use
+  (for example open in the E-APO editor), nothing changes and it tells you
+  which file.
+- If a backup fails, you can retry the backup itself instead of re-downloading
+  the library over and over.
+
 ## If you use BO7 V5
 
-Start with Classic+ at Ultra Low. Point the 16ch tune line in your
-`config.txt` at:
+Your current setup keeps working after the update: every previous V5 file is
+still there under the same name. To hear the new styles, start with Classic+
+at Ultra Low. Point the 16ch tune line in your `config.txt` at:
 
 ```
 Include: ArtTuneDB\library\BO7\V5\BO7_V5_16ch_ClassicPlus-UltraLoGun.txt

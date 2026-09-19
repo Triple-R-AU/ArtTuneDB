@@ -25,7 +25,7 @@ $ProgressPreference = 'SilentlyContinue'
 # mirror retry fires. BITS has its own transport and is unaffected either way.
 try { [System.Net.ServicePointManager]::DefaultConnectionLimit = 12 } catch { }
 
-$script:Version = "1.2"
+$script:Version = "1.3"
 # Resolve 8.3 short names (e.g. LEDZIU~1) to long form for BITS compatibility
 $tempParent = $env:TEMP
 if (Test-Path $tempParent) { $tempParent = (Get-Item $tempParent).FullName }
@@ -116,7 +116,7 @@ $script:UseGitHubRelease = $false
 # Fallback only. The live name is derived from CDN latest-version.txt
 # as "ArtTuneDB-$cdnVersion.zip"; keep this in step with the stamp in
 # library/version.txt.
-$script:LibraryReleaseAsset = 'ArtTuneDB-2026.07.1-Overhaul.zip'
+$script:LibraryReleaseAsset = 'ArtTuneDB-2026.09-V5Styles.zip'
 
 # Anonymous setup counter endpoint. Fire-and-forget; silent on failure.
 $script:SetupPingUrl = "https://artiswar.io/api/setup-ping"

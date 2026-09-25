@@ -3624,7 +3624,8 @@ function Invoke-FreshStart {
     if ($hasVm)      { $toRemove += "Voicemeeter" }
     Write-Host "$($script:BoxMargin)This will remove: $($toRemove -join ', ')" -ForegroundColor Yellow
     Write-Host "$($script:BoxMargin)Your E-APO config and ArtTuneDB library (including any squig.link EQs)" -ForegroundColor Yellow
-    Write-Host "$($script:BoxMargin)are backed up first to Documents\Art Tune Backups\." -ForegroundColor Yellow
+    Write-Host "$($script:BoxMargin)are backed up first to an 'Art Tune Backups' folder -- normally in" -ForegroundColor Yellow
+    Write-Host "$($script:BoxMargin)Documents. The exact location is named as it runs." -ForegroundColor Yellow
     Write-Host "$($script:BoxMargin)A restart afterward finishes clearing the drivers." -ForegroundColor Yellow
     Write-Host ""
 
@@ -6235,11 +6236,21 @@ try {
         Write-Host "$($script:BoxMargin)This backs up your current ArtTuneDB library -- including any" -ForegroundColor Yellow
         Write-Host "$($script:BoxMargin)squig.link EQs you added -- to a dated folder, then downloads a" -ForegroundColor Yellow
         Write-Host "$($script:BoxMargin)fresh library. You will need to recopy or remake those EQs." -ForegroundColor Yellow
-        Write-Host "$($script:BoxMargin)Backup location: Documents\Art Tune Backups\library-<date>" -ForegroundColor DarkGray
+        # Name the location the backup will ACTUALLY use: Documents is only the first
+        # candidate, and the whole point of Get-ArtTuneBackupRoot is that it falls back
+        # when Documents is not writable. Resolving creates the folder, so a declined
+        # prompt hands it to Remove-UnusedBackupRoot exactly like the uninstall gates.
+        $libBackupRoot = Get-ArtTuneBackupRoot
+        if ($libBackupRoot) {
+            Write-Host "$($script:BoxMargin)Backup location: $libBackupRoot\library-<date>" -ForegroundColor DarkGray
+        } else {
+            Write-Host "$($script:BoxMargin)No writable backup location could be found. Your library will NOT be" -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)replaced without one -- you will be asked what to do." -ForegroundColor Yellow
+        }
         Write-Host ""
         Write-Host "$($script:BoxMargin)Continue? [Y/n]: " -ForegroundColor Yellow -NoNewline
         $libGo = Read-Host
-        if ($libGo -eq 'n' -or $libGo -eq 'N') { continue mainMenu }
+        if ($libGo -eq 'n' -or $libGo -eq 'N') { Remove-UnusedBackupRoot; continue mainMenu }
 
         if (-not (Test-Path $script:TempPath)) {
             New-Item -ItemType Directory -Path $script:TempPath -Force | Out-Null
@@ -6249,7 +6260,11 @@ try {
         $null = Install-ArtTuneLibrary
         Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host ""
-        Write-Host "$($script:BoxMargin)Your previous library is in Documents\Art Tune Backups\ -- open the" -ForegroundColor DarkGray
+        if ($script:BackupRoot) {
+            Write-Host "$($script:BoxMargin)Your previous library is in $($script:BackupRoot) -- open the" -ForegroundColor DarkGray
+        } else {
+            Write-Host "$($script:BoxMargin)Your previous library is in the backup folder named above -- open the" -ForegroundColor DarkGray
+        }
         Write-Host "$($script:BoxMargin)ArtTuneDB desktop shortcut to recover old squig.link combos." -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "$($script:BoxMargin)Done. Press any key to return to the menu." -ForegroundColor Green
@@ -6477,7 +6492,7 @@ try {
             Write-Host "$($script:BoxMargin)Use [3] Redownload Library to update (it backs up your custom EQs first)." -ForegroundColor DarkGray
         } elseif ($libState.State -eq 'OldUnversioned') {
             Write-Host "$($script:BoxMargin)An older ArtTuneDB library (no version stamp) was found." -ForegroundColor Yellow
-            Write-Host "$($script:BoxMargin)Backing it up to Documents\Art Tune Backups\, then installing the new versioned library..." -ForegroundColor Yellow
+            Write-Host "$($script:BoxMargin)Backing it up first (the location is named below), then installing the new versioned library..." -ForegroundColor Yellow
             $null = Install-ArtTuneLibrary
             Write-Host "$($script:BoxMargin)Old squig.link EQs are recoverable from that backup via the ArtTuneDB desktop shortcut." -ForegroundColor DarkGray
         } else {

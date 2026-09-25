@@ -2238,7 +2238,11 @@ function Backup-ArtTuneLibrary {
     #>
     param([switch]$Rolling, [switch]$RefreshBackupRoot)
 
-    $libraryPath = Join-Path $env:ProgramFiles "EqualizerAPO\config\ArtTuneDB\library"
+    # Via $script:ArtTuneDBRoot (:99), not a second Join-Path off $env:ProgramFiles.
+    # Identical in production, but this function decides whether the library may be
+    # destroyed, so it must read the SAME root the lay-down and the state check use --
+    # one definition, no chance of the two drifting apart.
+    $libraryPath = Join-Path $script:ArtTuneDBRoot "library"
 
     if (-not (Test-Path $libraryPath)) { return $null }
 

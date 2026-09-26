@@ -3,6 +3,8 @@
 Three new tuning styles for BO7 V5, a new self gun level, and a change to how
 your own footsteps and gunfire are handled on every style.
 
+**Video walkthrough: https://youtu.be/JkF5kCVIRnU**
+
 - **Classic, Classic+ and Open** are new. What they share is much slower
   leveller timing, and that is the biggest single change in how V5 feels: the
   processing stops drawing attention to itself and sits far closer to the old

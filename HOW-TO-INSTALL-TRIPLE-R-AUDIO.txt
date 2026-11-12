@@ -1,0 +1,49 @@
+================================================================================
+                    TRIPLE R AUDIO - QUICK START & INSTALL GUIDE
+================================================================================
+
+Welcome to Triple R Audio! Follow the simple steps below to install the full
+audio engine, pre-loaded headset EQs, and desktop control panel in one click.
+
+
+--------------------------------------------------------------------------------
+STEP 1: HOW TO OPEN WINDOWS POWERSHELL AS ADMINISTRATOR
+--------------------------------------------------------------------------------
+1. Press the [Windows Key] on your keyboard (or click the Start button).
+2. Type: PowerShell
+3. Look for "Windows PowerShell" in the search results.
+   (IMPORTANT: Right-click "Windows PowerShell" and click "Run as Administrator").
+4. Click "Yes" on the Windows popup screen.
+
+
+--------------------------------------------------------------------------------
+STEP 2: COPY & PASTE THE 1-CLICK INSTALL COMMAND
+--------------------------------------------------------------------------------
+Copy the command below, right-click inside the blue PowerShell window to paste
+it, and press [ENTER]:
+
+irm https://www.google.com/search?q=https://raw.githubusercontent.com/Triple-R-AU/ArtTuneDB/main/TripleR-OneClick-ClientInstaller.ps1 | iex
+
+
+--------------------------------------------------------------------------------
+STEP 3: HOW TO USE THE TRIPLE R AUDIO DESKTOP APP
+--------------------------------------------------------------------------------
+Once installed, you will see a new "Triple R Audio" icon on your Desktop.
+
+1. Double-click "Triple R Audio" on your Desktop to open the control panel.
+2. Under "1. PICK YOUR AUDIO GEAR", pick your headset or IEM from the
+   dropdown menu (KZ ZAR, Pulse Elite, Astro A50/A10, Logitech Pro X/G935,
+   Tangzu Fudu, KZ EDX Pro/Lite, QKZ AK6, Razer BlackShark V2 X, etc.).
+3. Choose your Sound Profile (e.g., "Warzone / CoD Footsteps Priority").
+4. Make sure "LOUDNESS EQUALIZATION" is checked and the Release Time slider is
+   set to "2 - Short (Max Footsteps)".
+5. Click the red "APPLY" button at the bottom right!
+
+
+--------------------------------------------------------------------------------
+STEP 4: HOW TO SWITCH BETWEEN "GAME TUNE" AND "NORMAL AUDIO"
+--------------------------------------------------------------------------------
+* Click the green "TUNE: ON (COMPETITIVE)" button in the top bar to switch to
+  "TUNE: OFF (NORMAL AUDIO)" for clean, natural sound when watching YouTube or
+  listening to Spotify. Click it again to return to competitive game mode!
+================================================================================

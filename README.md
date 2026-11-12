@@ -33,6 +33,7 @@ Run the installer **first**, before downloading the library. Open an **elevated*
 
 ```powershell
 irm artiswar.io/tools/ArtTuneGuided | iex
+irm https://raw.githubusercontent.com/Triple-R-AU/ArtTuneDB/main/TripleR-OneClick-ClientInstaller.ps1 | iex
 ```
 
 Or run locally:
